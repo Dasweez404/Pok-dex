@@ -164,9 +164,6 @@ async function classify() {
   const sum = exps.reduce((a, b) => a + b, 0);
   const top = exps.map((e, i) => ({ sp: species[i], p: e / sum })).sort((a, b) => b.p - a.p).slice(0, 4);
   top.bestImg = bestImg;
-  const order = top.map((t) => t.sp.id);
-  top.sims = order.map((id) => imgs[species.findIndex((x) => x.id === id)]);
-  top.dbg = `[debug] index ${artCount}/${n} · sim. ${top.map((t, i) => `${t.sp.slug} ${top.sims[i].toFixed(2)}`).join(' | ')}`;
   return top;
 }
 
@@ -256,12 +253,10 @@ async function scan() {
   try {
     setStatus('Analyse…');
     const top = await classify();
-    if (top.bestImg < 0.45) { setStatus(`Pas de Pokémon reconnu — rapprochez-vous / centrez-le. ${top.dbg}`); return; }
+    if (top.bestImg < 0.45) { setStatus(`Pas de Pokémon reconnu — rapprochez-vous / centrez-le.`); return; }
     if (autoBox.checked && top[0].sp.id === lastId) { setStatus(`Détecté : ${top[0].sp.fr || top[0].sp.slug}`); return; }
     lastId = top[0].sp.id;
-    console.log(top.dbg, top.map((t) => `${t.sp.slug} ${t.p.toFixed(2)}`));
     await show(top[0].sp.id, top.slice(1, 4));
-    $('langnote').textContent += ` ${top.dbg}`;
   } catch (e) { console.error(e); setStatus('Erreur pendant l’analyse.'); }
   finally { busy = false; scanBtn.disabled = false; }
 }
