@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#dc2626">
+<title>Pokédex Caméra</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1><span class="dot"></span> Pokédex</h1>
+  <form id="search" autocomplete="off">
+    <input id="q" list="names" placeholder="Nom ou n° (ex. Salamèche, 25)" aria-label="Rechercher un Pokémon">
+    <datalist id="names"></datalist>
+    <button type="submit">OK</button>
+  </form>
+</header>
+
+<main>
+  <section class="camera">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="reticle"></div>
+    <div id="status" class="status">Chargement…</div>
+    <div class="controls">
+      <button id="scan" disabled>📷 Scanner</button>
+      <label class="auto"><input type="checkbox" id="auto"> Auto</label>
+      <button id="flip" class="ghost" title="Changer de caméra">🔄</button>
+    </div>
+    <canvas id="canvas" hidden></canvas>
+  </section>
+
+  <section id="result" class="result" hidden>
+    <div class="art"><img id="art" alt=""></div>
+    <div class="info">
+      <p class="num" id="num"></p>
+      <h2 id="fr"></h2>
+      <p class="en" id="en"></p>
+      <p class="types" id="types"></p>
+      <h3>Entrées du Pokédex</h3>
+      <p id="desc" class="desc"></p>
+      <p class="langnote" id="langnote"></p>
+      <div id="alts" class="alts"></div>
+    </div>
+  </section>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
