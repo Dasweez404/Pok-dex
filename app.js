@@ -139,16 +139,15 @@ function normalizeRows(data, rows) {
 async function classify() {
   const w = video.videoWidth, h = video.videoHeight;
   const side = Math.min(w, h);
-  // Deux cadrages : zone centrale (réticule) et image entière.
-  const crops = [
-    flatten(video, w, h, (w - side * 0.7) / 2, (h - side * 0.7) / 2, side * 0.7, side * 0.7),
-    flatten(video, w, h, (w - side) / 2, (h - side) / 2, side, side),
-  ];
+  // Trois cadrages (le Pokémon peut être petit dans l'image) : centre 50 %, 70 % et 100 %.
+  const crops = [0.5, 0.7, 1].map((k) =>
+    flatten(video, w, h, (w - side * k) / 2, (h - side * k) / 2, side * k, side * k));
   const vs = [];
   for (const c of crops) vs.push(await embedCanvas(c));
 
   const n = species.length, logits = new Float32Array(n);
   let bestImg = 0;
+  const imgs = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     let img = 0, txt = 0;
     for (const v of vs) {
@@ -157,6 +156,7 @@ async function classify() {
       img = Math.max(img, a); txt = Math.max(txt, t);
     }
     bestImg = Math.max(bestImg, img);
+    imgs[i] = img;
     logits[i] = img * 100 + txt * 50;          // l'image prime, le texte départage
   }
   const max = Math.max(...logits);
@@ -164,7 +164,9 @@ async function classify() {
   const sum = exps.reduce((a, b) => a + b, 0);
   const top = exps.map((e, i) => ({ sp: species[i], p: e / sum })).sort((a, b) => b.p - a.p).slice(0, 4);
   top.bestImg = bestImg;
-  top.dbg = `[debug] index ${artCount}/${n} · sim. image max ${bestImg.toFixed(2)}`;
+  const order = top.map((t) => t.sp.id);
+  top.sims = order.map((id) => imgs[species.findIndex((x) => x.id === id)]);
+  top.dbg = `[debug] index ${artCount}/${n} · sim. ${top.map((t, i) => `${t.sp.slug} ${top.sims[i].toFixed(2)}`).join(' | ')}`;
   return top;
 }
 
@@ -259,6 +261,7 @@ async function scan() {
     lastId = top[0].sp.id;
     console.log(top.dbg, top.map((t) => `${t.sp.slug} ${t.p.toFixed(2)}`));
     await show(top[0].sp.id, top.slice(1, 4));
+    $('langnote').textContent += ` ${top.dbg}`;
   } catch (e) { console.error(e); setStatus('Erreur pendant l’analyse.'); }
   finally { busy = false; scanBtn.disabled = false; }
 }
