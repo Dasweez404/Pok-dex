@@ -183,47 +183,99 @@ function mergeEntries(entries, lang) {
   return parts.join(' ');
 }
 
+const TYPE_COLORS = {
+  normal: '#6d6d5a', fire: '#c2410c', water: '#2563eb', grass: '#2f7d3b', electric: '#a16207', ice: '#0e7490',
+  fighting: '#b91c1c', poison: '#7e3fa0', ground: '#92602a', flying: '#4f5fb8', psychic: '#c2315e', bug: '#5f7d12',
+  rock: '#7a6a3a', ghost: '#5b4a8a', dragon: '#4c3fc0', dark: '#3f3a38', steel: '#4b6a7a', fairy: '#b5467e',
+};
+const FALLBACK_COLOR = '#4b5563';
+const REGIONS = { i: 'Kanto', ii: 'Johto', iii: 'Hoenn', iv: 'Sinnoh', v: 'Unys', vi: 'Kalos', vii: 'Alola', viii: 'Galar', ix: 'Paldea' };
+const DEX_REGIONS = [
+  ['kanto', 'Kanto'], ['johto', 'Johto'], ['hoenn', 'Hoenn'], ['sinnoh', 'Sinnoh'], ['unova', 'Unys'],
+  ['kalos', 'Kalos'], ['alola', 'Alola'], ['galar', 'Galar'], ['isle-of-armor', 'Galar'], ['crown-tundra', 'Galar'],
+  ['hisui', 'Hisui'], ['paldea', 'Paldea'], ['kitakami', 'Paldea'], ['blueberry', 'Paldea'],
+];
+const STAT_LABELS = { hp: 'PV', attack: 'Attaque', defense: 'Défense', 'special-attack': 'Att. Spé.', 'special-defense': 'Déf. Spé.', speed: 'Vitesse' };
+
+const getJson = async (url) => (await fetch(url)).json();
+const frName = (o, fallback) => o.names?.find((n) => n.language.name === 'fr')?.name || fallback;
+
 async function loadPokemon(id) {
-  const sp = await (await fetch(`${API}/pokemon-species/${id}`)).json();
-  const fr = sp.names.find((n) => n.language.name === 'fr')?.name || sp.name;
+  const sp = await getJson(`${API}/pokemon-species/${id}`);
+  const fr = frName(sp, sp.name);
   const en = sp.names.find((n) => n.language.name === 'en')?.name || sp.name;
   let desc = mergeEntries(sp.flavor_text_entries, 'fr'), lang = 'fr';
   if (!desc) { desc = mergeEntries(sp.flavor_text_entries, 'en'); lang = 'en'; }
+  const genus = (sp.genera.find((g) => g.language.name === 'fr') || sp.genera.find((g) => g.language.name === 'en'))?.genus || '';
 
-  let types = [];
-  try {
-    const variety = sp.varieties.find((v) => v.is_default) || sp.varieties[0];
-    const poke = await (await fetch(variety.pokemon.url)).json();
-    types = await Promise.all(poke.types.map(async (t) => {
-      const ty = await (await fetch(t.type.url)).json();
-      return ty.names.find((n) => n.language.name === 'fr')?.name || t.type.name;
-    }));
-  } catch { /* types facultatifs */ }
-  return { id: sp.id, fr, en, desc, lang, types };
+  const p = { id: sp.id, fr, en, desc, lang, genus, types: [], abilities: [], stats: [], habitat: '', origin: '', regions: [], height: null, weight: null };
+  p.origin = REGIONS[sp.generation?.name?.replace('generation-', '')] || '';
+  const dex = new Set();
+  for (const d of sp.pokedex_numbers) {
+    const hit = DEX_REGIONS.find(([k]) => d.pokedex.name.includes(k));
+    if (hit) dex.add(hit[1]);
+  }
+  p.regions = [...dex];
+
+  const tasks = [];
+  const variety = sp.varieties.find((v) => v.is_default) || sp.varieties[0];
+  tasks.push(getJson(variety.pokemon.url).then(async (poke) => {
+    p.height = poke.height / 10; p.weight = poke.weight / 10;
+    p.stats = poke.stats.map((s) => ({ label: STAT_LABELS[s.stat.name] || s.stat.name, value: s.base_stat }));
+    const [types, abilities] = await Promise.all([
+      Promise.all(poke.types.map(async (t) => ({ slug: t.type.name, name: frName(await getJson(t.type.url), t.type.name) }))),
+      Promise.all(poke.abilities.map(async (a) => ({ name: frName(await getJson(a.ability.url), a.ability.name), hidden: a.is_hidden }))),
+    ]);
+    p.types = types; p.abilities = abilities;
+  }).catch(() => {}));
+  if (sp.habitat) tasks.push(getJson(sp.habitat.url).then((h) => { p.habitat = frName(h, sp.habitat.name); }).catch(() => {}));
+  await Promise.all(tasks);
+  return p;
 }
+
+const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+const fmt = (n) => n.toLocaleString('fr-FR', { maximumFractionDigits: 1 });
 
 let alternatives = [];
 async function show(id, alts = []) {
   setStatus('Recherche des informations…');
   try {
     const p = await loadPokemon(id);
+    const color = TYPE_COLORS[p.types[0]?.slug] || FALLBACK_COLOR;
+    document.documentElement.style.setProperty('--t', color);
+    document.querySelector('meta[name=theme-color]').content = color;
     $('art').src = `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${p.id}.png`;
     $('art').alt = p.fr;
     $('num').textContent = `N° ${String(p.id).padStart(4, '0')}`;
     $('fr').textContent = p.fr;
-    $('en').textContent = p.en !== p.fr ? p.en : '';
-    $('types').replaceChildren(...p.types.map((t) => Object.assign(document.createElement('span'), { textContent: t })));
+    $('en').textContent = [p.en !== p.fr ? p.en : '', p.genus].filter(Boolean).join(' · ');
+    $('types').replaceChildren(...p.types.map((t) => el('span', { textContent: t.name, style: `color:${TYPE_COLORS[t.slug] || FALLBACK_COLOR}` })));
     $('desc').textContent = p.desc || 'Aucune entrée de Pokédex disponible.';
     $('langnote').textContent = p.lang === 'en' ? 'Entrées disponibles uniquement en anglais.' : '';
+
+    const facts = [
+      ['Taille', p.height != null && `${fmt(p.height)} m`],
+      ['Poids', p.weight != null && `${fmt(p.weight)} kg`],
+      ['Région d’origine', p.origin],
+      ['Habitat', p.habitat],
+      ['Talents', p.abilities.length && p.abilities.map((a) => a.hidden ? `${a.name} (caché)` : a.name).join(', ')],
+      ['Présent dans les Pokédex de', p.regions.length && p.regions.join(', ')],
+    ].filter(([, v]) => v);
+    $('facts').replaceChildren(...facts.map(([k, v]) => el('div', {}, el('dt', { textContent: k }), el('dd', { textContent: v }))));
+
+    $('stats').replaceChildren(...p.stats.map((s) => el('div', { className: 'stat' },
+      el('span', { textContent: s.label }), el('b', { textContent: s.value }),
+      el('i', {}, el('u', { style: `width:${Math.min(100, (s.value / 200) * 100)}%` })))));
+
     const box = $('alts');
     box.replaceChildren();
     if (alts.length) {
-      box.append(Object.assign(document.createElement('small'), { textContent: 'Ce n’est pas lui ? ' }));
+      box.append(el('small', { textContent: 'Ce n’est pas lui ? ' }));
       for (const a of alts) {
-        const b = document.createElement('button');
-        b.textContent = `${a.sp.fr || a.sp.slug} (${Math.round(a.p * 100)} %)`;
-        b.onclick = () => show(a.sp.id, alts.filter((x) => x !== a));
-        box.append(b);
+        box.append(el('button', {
+          textContent: `${a.sp.fr || a.sp.slug} (${Math.round(a.p * 100)} %)`,
+          onclick: () => show(a.sp.id, alts.filter((x) => x !== a)),
+        }));
       }
     }
     $('result').hidden = false;
