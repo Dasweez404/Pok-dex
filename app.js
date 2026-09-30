@@ -10,7 +10,8 @@ const scanBtn = $('scan'), autoBox = $('auto');
 const setStatus = (t) => (statusEl.textContent = t);
 
 let species = [];            // [{id, slug, fr}]
-let labelEmbeds = null;      // Float32Array (n * dim), normalisés
+let labelEmbeds = null;      // Float32Array (n * dim), normalisés (texte)
+let artEmbeds = null;        // Float32Array (n * dim), normalisés (artworks officiels)
 let dim = 512;
 let tokenizer, processor, textModel, visionModel;
 let facing = 'environment', stream = null, busy = false;
@@ -60,7 +61,7 @@ async function loadModel() {
   ]);
   const key = `labels-v1-${species.length}`;
   const cached = await cacheGet(key);
-  if (cached) { labelEmbeds = cached; return; }
+  if (cached) { labelEmbeds = cached; return loadArtIndex(); }
 
   const all = new Float32Array(species.length * dim);
   const B = 32;
@@ -74,6 +75,48 @@ async function loadModel() {
   }
   labelEmbeds = all;
   await cachePut(key, all);
+  await loadArtIndex();
+}
+
+/* ---------- Index visuel : embeddings des artworks officiels (une seule fois) ---------- */
+const artUrl = (id) => `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${id}.png`;
+
+// Dessine une image sur fond blanc (les PNG transparents deviendraient noirs sinon).
+function flatten(source, sw, sh, sx = 0, sy = 0, cw = sw, ch = sh) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 224;
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, 224, 224);
+  const k = Math.min(224 / cw, 224 / ch);
+  g.drawImage(source, sx, sy, cw, ch, (224 - cw * k) / 2, (224 - ch * k) / 2, cw * k, ch * k);
+  return c;
+}
+async function embedCanvas(c) {
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.92));
+  const { pixel_values } = await processor(await RawImage.fromBlob(blob));
+  const { image_embeds } = await visionModel({ pixel_values });
+  return normalizeRows(image_embeds.data, 1);
+}
+
+async function loadArtIndex() {
+  const key = `arts-v1-${species.length}`;
+  const cached = await cacheGet(key);
+  if (cached) { artEmbeds = cached; return; }
+  const n = species.length, all = new Float32Array(n * dim), done = new Uint8Array(n);
+  const B = 8;
+  for (let i = 0; i < n; i += B) {
+    setStatus(`Apprentissage des artworks officiels… ${Math.round((i / n) * 100)} % (une seule fois, garde la page ouverte)`);
+    await Promise.all(species.slice(i, i + B).map(async (sp, j) => {
+      try {
+        const bmp = await createImageBitmap(await (await fetch(artUrl(sp.id))).blob());
+        all.set(await embedCanvas(flatten(bmp, bmp.width, bmp.height)), (i + j) * dim);
+        done[i + j] = 1;
+      } catch { /* artwork manquant : on retombe sur le texte pour cette espèce */ }
+    }));
+  }
+  // Une espèce sans artwork garde un vecteur nul : son score image sera 0.
+  artEmbeds = all;
+  if (done.reduce((a, b) => a + b, 0) > n * 0.9) await cachePut(key, all);
 }
 
 function normalizeRows(data, rows) {
@@ -89,25 +132,33 @@ function normalizeRows(data, rows) {
 
 async function classify() {
   const w = video.videoWidth, h = video.videoHeight;
-  const side = Math.min(w, h) * 0.8;           // zone centrale (réticule)
-  canvas.width = canvas.height = 224;
-  canvas.getContext('2d').drawImage(video, (w - side) / 2, (h - side) / 2, side, side, 0, 0, 224, 224);
-  const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.9));
-  const image = await RawImage.fromBlob(blob);
-  const { pixel_values } = await processor(image);
-  const { image_embeds } = await visionModel({ pixel_values });
-  const v = normalizeRows(image_embeds.data, 1);
+  const side = Math.min(w, h);
+  // Deux cadrages : zone centrale (réticule) et image entière.
+  const crops = [
+    flatten(video, w, h, (w - side * 0.7) / 2, (h - side * 0.7) / 2, side * 0.7, side * 0.7),
+    flatten(video, w, h, (w - side) / 2, (h - side) / 2, side, side),
+  ];
+  const vs = [];
+  for (const c of crops) vs.push(await embedCanvas(c));
 
-  const n = species.length, scores = new Float32Array(n);
+  const n = species.length, logits = new Float32Array(n);
+  let bestImg = 0;
   for (let i = 0; i < n; i++) {
-    let s = 0;
-    for (let d = 0; d < dim; d++) s += v[d] * labelEmbeds[i * dim + d];
-    scores[i] = s * 100;                        // logit scale de CLIP
+    let img = 0, txt = 0;
+    for (const v of vs) {
+      let a = 0, t = 0;
+      for (let d = 0; d < dim; d++) { a += v[d] * artEmbeds[i * dim + d]; t += v[d] * labelEmbeds[i * dim + d]; }
+      img = Math.max(img, a); txt = Math.max(txt, t);
+    }
+    bestImg = Math.max(bestImg, img);
+    logits[i] = img * 100 + txt * 50;          // l'image prime, le texte départage
   }
-  const max = Math.max(...scores);
-  const exps = Array.from(scores, (s) => Math.exp(s - max));
+  const max = Math.max(...logits);
+  const exps = Array.from(logits, (s) => Math.exp(s - max));
   const sum = exps.reduce((a, b) => a + b, 0);
-  return exps.map((e, i) => ({ sp: species[i], p: e / sum })).sort((a, b) => b.p - a.p).slice(0, 4);
+  const top = exps.map((e, i) => ({ sp: species[i], p: e / sum })).sort((a, b) => b.p - a.p).slice(0, 4);
+  top.bestImg = bestImg;
+  return top;
 }
 
 /* ---------- Données Pokémon (PokéAPI) ---------- */
@@ -191,12 +242,12 @@ async function startCamera() {
 
 let lastId = null;
 async function scan() {
-  if (busy || !labelEmbeds || !video.videoWidth) return;
+  if (busy || !labelEmbeds || !artEmbeds || !video.videoWidth) return;
   busy = true; scanBtn.disabled = true;
   try {
     setStatus('Analyse…');
     const top = await classify();
-    if (top[0].p < 0.15) { setStatus('Pas de Pokémon reconnu — rapprochez-vous / centrez-le.'); return; }
+    if (top.bestImg < 0.45) { setStatus('Pas de Pokémon reconnu — rapprochez-vous / centrez-le.'); return; }
     if (autoBox.checked && top[0].sp.id === lastId) { setStatus(`Détecté : ${top[0].sp.fr || top[0].sp.slug}`); return; }
     lastId = top[0].sp.id;
     await show(top[0].sp.id, top.slice(1, 4));
