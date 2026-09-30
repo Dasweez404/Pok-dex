@@ -11,6 +11,7 @@ const setStatus = (t) => (statusEl.textContent = t);
 
 let species = [];            // [{id, slug, fr}]
 let labelEmbeds = null;      // Float32Array (n * dim), normalisés (texte)
+let artCount = 0;            // artworks effectivement indexés
 let artEmbeds = null;        // Float32Array (n * dim), normalisés (artworks officiels)
 let dim = 512;
 let tokenizer, processor, textModel, visionModel;
@@ -101,22 +102,27 @@ async function embedCanvas(c) {
 async function loadArtIndex() {
   const key = `arts-v1-${species.length}`;
   const cached = await cacheGet(key);
-  if (cached) { artEmbeds = cached; return; }
+  if (cached) { artEmbeds = cached; artCount = species.length; return; }
   const n = species.length, all = new Float32Array(n * dim), done = new Uint8Array(n);
   const B = 8;
   for (let i = 0; i < n; i += B) {
     setStatus(`Apprentissage des artworks officiels… ${Math.round((i / n) * 100)} % (une seule fois, garde la page ouverte)`);
     await Promise.all(species.slice(i, i + B).map(async (sp, j) => {
-      try {
-        const bmp = await createImageBitmap(await (await fetch(artUrl(sp.id))).blob());
-        all.set(await embedCanvas(flatten(bmp, bmp.width, bmp.height)), (i + j) * dim);
-        done[i + j] = 1;
-      } catch { /* artwork manquant : on retombe sur le texte pour cette espèce */ }
+      for (let t = 0; t < 3 && !done[i + j]; t++) {
+        try {
+          const r = await fetch(artUrl(sp.id));
+          if (!r.ok) throw new Error(r.status);
+          const bmp = await createImageBitmap(await r.blob());
+          all.set(await embedCanvas(flatten(bmp, bmp.width, bmp.height)), (i + j) * dim);
+          done[i + j] = 1;
+        } catch { await new Promise((r) => setTimeout(r, 400 * (t + 1))); }
+      }
     }));
   }
   // Une espèce sans artwork garde un vecteur nul : son score image sera 0.
   artEmbeds = all;
-  if (done.reduce((a, b) => a + b, 0) > n * 0.9) await cachePut(key, all);
+  artCount = done.reduce((a, b) => a + b, 0);
+  if (artCount > n * 0.98) await cachePut(key, all);
 }
 
 function normalizeRows(data, rows) {
@@ -158,6 +164,7 @@ async function classify() {
   const sum = exps.reduce((a, b) => a + b, 0);
   const top = exps.map((e, i) => ({ sp: species[i], p: e / sum })).sort((a, b) => b.p - a.p).slice(0, 4);
   top.bestImg = bestImg;
+  top.dbg = `[debug] index ${artCount}/${n} · sim. image max ${bestImg.toFixed(2)}`;
   return top;
 }
 
@@ -222,7 +229,7 @@ async function show(id, alts = []) {
     }
     $('result').hidden = false;
     $('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    setStatus(`Détecté : ${p.fr}`);
+    setStatus(`Détecté : ${p.fr}${artCount < species.length * 0.98 ? ` — ⚠ index visuel incomplet (${artCount}/${species.length})` : ''}`);
   } catch (e) {
     setStatus('Erreur réseau : impossible de charger les données.');
     console.error(e);
@@ -247,9 +254,10 @@ async function scan() {
   try {
     setStatus('Analyse…');
     const top = await classify();
-    if (top.bestImg < 0.45) { setStatus('Pas de Pokémon reconnu — rapprochez-vous / centrez-le.'); return; }
+    if (top.bestImg < 0.45) { setStatus(`Pas de Pokémon reconnu — rapprochez-vous / centrez-le. ${top.dbg}`); return; }
     if (autoBox.checked && top[0].sp.id === lastId) { setStatus(`Détecté : ${top[0].sp.fr || top[0].sp.slug}`); return; }
     lastId = top[0].sp.id;
+    console.log(top.dbg, top.map((t) => `${t.sp.slug} ${t.p.toFixed(2)}`));
     await show(top[0].sp.id, top.slice(1, 4));
   } catch (e) { console.error(e); setStatus('Erreur pendant l’analyse.'); }
   finally { busy = false; scanBtn.disabled = false; }
