@@ -1,9 +1,10 @@
 // Pokédex caméra : détection 100 % dans le navigateur (CLIP zero-shot) + données PokéAPI.
-import { AutoTokenizer, AutoProcessor, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, RawImage }
+import { AutoModel, AutoTokenizer, AutoProcessor, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, RawImage }
   from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5';
 
 const API = 'https://pokeapi.co/api/v2';
 const MODEL = 'Xenova/clip-vit-base-patch32';
+const DINO = 'Xenova/dinov2-small';   // très bon en recherche d'images similaires (complète CLIP)
 const $ = (id) => document.getElementById(id);
 const video = $('video'), canvas = $('canvas'), statusEl = $('status');
 const scanBtn = $('scan'), autoBox = $('auto');
@@ -15,6 +16,8 @@ let artCount = 0;            // artworks effectivement indexés
 let artEmbeds = null;        // Float32Array (n * dim), normalisés (artworks officiels)
 let dim = 512;
 let tokenizer, processor, textModel, visionModel;
+let dinoProcessor = null, dinoModel = null, dinoDim = 384;
+let artDino = null;          // Float32Array (n * dinoDim), normalisés
 let facing = 'environment', stream = null, busy = false;
 
 /* ---------- IndexedDB (cache des embeddings de texte) ---------- */
@@ -60,6 +63,9 @@ async function loadModel() {
     CLIPTextModelWithProjection.from_pretrained(MODEL),
     CLIPVisionModelWithProjection.from_pretrained(MODEL),
   ]);
+  try {
+    [dinoProcessor, dinoModel] = await Promise.all([AutoProcessor.from_pretrained(DINO), AutoModel.from_pretrained(DINO)]);
+  } catch (e) { console.warn('DINOv2 indisponible, repli sur CLIP seul', e); dinoProcessor = dinoModel = null; }
   const key = `labels-v1-${species.length}`;
   const cached = await cacheGet(key);
   if (cached) { labelEmbeds = cached; return loadArtIndex(); }
@@ -94,16 +100,24 @@ function flatten(source, sw, sh, sx = 0, sy = 0, cw = sw, ch = sh) {
 }
 async function embedCanvas(c) {
   const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.92));
-  const { pixel_values } = await processor(await RawImage.fromBlob(blob));
+  const image = await RawImage.fromBlob(blob);
+  const { pixel_values } = await processor(image);
   const { image_embeds } = await visionModel({ pixel_values });
-  return normalizeRows(image_embeds.data, 1);
+  const out = { clip: normalizeRows(image_embeds.data, 1), dino: null };
+  if (dinoModel) {
+    const px = (await dinoProcessor(image)).pixel_values;
+    const o = await dinoModel({ pixel_values: px });
+    const v = o.pooler_output ? o.pooler_output.data : o.last_hidden_state.data.slice(0, dinoDim);
+    out.dino = normalizeRows(v, 1, dinoDim);
+  }
+  return out;
 }
 
 async function loadArtIndex() {
-  const key = `arts-v1-${species.length}`;
+  const key = `arts-v2-${species.length}-${dinoModel ? 'd' : 'c'}`;
   const cached = await cacheGet(key);
-  if (cached) { artEmbeds = cached; artCount = species.length; return; }
-  const n = species.length, all = new Float32Array(n * dim), done = new Uint8Array(n);
+  if (cached) { artEmbeds = cached.clip; artDino = cached.dino; artCount = species.length; return; }
+  const n = species.length, all = new Float32Array(n * dim), allD = new Float32Array(n * dinoDim), done = new Uint8Array(n);
   const B = 8;
   for (let i = 0; i < n; i += B) {
     setStatus(`Apprentissage des artworks officiels… ${Math.round((i / n) * 100)} % (une seule fois, garde la page ouverte)`);
@@ -113,25 +127,26 @@ async function loadArtIndex() {
           const r = await fetch(artUrl(sp.id));
           if (!r.ok) throw new Error(r.status);
           const bmp = await createImageBitmap(await r.blob());
-          all.set(await embedCanvas(flatten(bmp, bmp.width, bmp.height)), (i + j) * dim);
+          const e = await embedCanvas(flatten(bmp, bmp.width, bmp.height));
+          all.set(e.clip, (i + j) * dim);
+          if (e.dino) allD.set(e.dino, (i + j) * dinoDim);
           done[i + j] = 1;
         } catch { await new Promise((r) => setTimeout(r, 400 * (t + 1))); }
       }
     }));
   }
-  // Une espèce sans artwork garde un vecteur nul : son score image sera 0.
-  artEmbeds = all;
+  artEmbeds = all; artDino = dinoModel ? allD : null;
   artCount = done.reduce((a, b) => a + b, 0);
-  if (artCount > n * 0.98) await cachePut(key, all);
+  if (artCount > n * 0.98) await cachePut(key, { clip: all, dino: artDino });
 }
 
-function normalizeRows(data, rows) {
-  const out = new Float32Array(rows * dim);
+function normalizeRows(data, rows, dm = dim) {
+  const out = new Float32Array(rows * dm);
   for (let r = 0; r < rows; r++) {
     let n = 0;
-    for (let d = 0; d < dim; d++) n += data[r * dim + d] ** 2;
+    for (let d = 0; d < dm; d++) n += data[r * dm + d] ** 2;
     n = Math.sqrt(n) || 1;
-    for (let d = 0; d < dim; d++) out[r * dim + d] = data[r * dim + d] / n;
+    for (let d = 0; d < dm; d++) out[r * dm + d] = data[r * dm + d] / n;
   }
   return out;
 }
@@ -147,17 +162,21 @@ async function classify() {
 
   const n = species.length, logits = new Float32Array(n);
   let bestImg = 0;
-  const imgs = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    let img = 0, txt = 0;
+    let img = 0, txt = 0, dn = 0;
     for (const v of vs) {
       let a = 0, t = 0;
-      for (let d = 0; d < dim; d++) { a += v[d] * artEmbeds[i * dim + d]; t += v[d] * labelEmbeds[i * dim + d]; }
+      for (let d = 0; d < dim; d++) { a += v.clip[d] * artEmbeds[i * dim + d]; t += v.clip[d] * labelEmbeds[i * dim + d]; }
       img = Math.max(img, a); txt = Math.max(txt, t);
+      if (v.dino && artDino) {
+        let q = 0;
+        for (let d = 0; d < dinoDim; d++) q += v.dino[d] * artDino[i * dinoDim + d];
+        dn = Math.max(dn, q);
+      }
     }
     bestImg = Math.max(bestImg, img);
-    imgs[i] = img;
-    logits[i] = img * 100 + txt * 50;          // l'image prime, le texte départage
+    // DINOv2 (forme/apparence précise) > CLIP image > texte (départage)
+    logits[i] = artDino ? dn * 140 + img * 50 + txt * 30 : img * 100 + txt * 50;
   }
   const max = Math.max(...logits);
   const exps = Array.from(logits, (s) => Math.exp(s - max));
